@@ -1,0 +1,43 @@
+# main 브랜치 push → 테스트 → 이미지 빌드/푸시 → Cloud Run Job 갱신
+# $PROJECT_ID, $SHORT_SHA 는 Cloud Build 트리거가 자동으로 채운다.
+substitutions:
+  _REGION: asia-northeast3
+  _AR_REPO: ingest
+  _JOB: ingest-bids
+  _RUNTIME_SA: ingest-job-sa
+
+steps:
+  - id: test
+    name: python:3.12-slim
+    entrypoint: bash
+    args: ["-c", "pip install -q -r requirements-dev.txt && python -m pytest -q"]
+
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_JOB}:$SHORT_SHA", "."]
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ["push", "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_JOB}:$SHORT_SHA"]
+
+  # 이 단계가 없으면 Job은 이전 이미지로 계속 실행된다
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - deploy
+      - ${_JOB}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_JOB}:$SHORT_SHA
+      - --region=${_REGION}
+      - --service-account=${_RUNTIME_SA}@$PROJECT_ID.iam.gserviceaccount.com
+      - --env-vars-file=deploy/env.yaml
+      - --set-secrets=OPENAPI_KEY=openapi-key:latest
+      - --tasks=1
+      - --max-retries=2
+      - --task-timeout=3600s
+      - --memory=2Gi
+
+options:
+  logging: CLOUD_LOGGING_ONLY

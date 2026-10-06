@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+.DS_Store
+# 서비스 계정 키 등 자격증명 — 절대 커밋하지 않는다
+*.json
+# 참고용 노트북 (로컬 전용)
+*.ipynb
