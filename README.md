@@ -20,9 +20,9 @@ Cloud Scheduler(매일) → Cloud Run Job → 나라장터 API 6종 → BigQuery
 | indstryty_base_lawrglt_info | 전체 (마스터 데이터) | indstryty_base_lawrglt_info | 전체 덮어쓰기 |
 
 - **대상 날짜**: 기본은 KST 기준 어제. `TARGET_DATE=YYYY-MM-DD`로 지정할 수 있다.
-- **날짜 교체**: 각 테이블에 `ingest_date`(DATE) 컬럼을 추가하고, `DELETE WHERE ingest_date = 대상날짜` 후 APPEND한다. 같은 날짜를 몇 번 다시 실행해도 중복되지 않는다.
+- **날짜 교체**: daily 테이블은 `ingest_date`(DATE)로 파티션되어 있고, 대상 날짜 파티션(`table$YYYYMMDD`)에 WRITE_TRUNCATE로 로드한다. 같은 날짜를 몇 번 다시 실행해도 중복되지 않고, 로드가 실패하면 기존 파티션이 그대로 남는다. DELETE(DML)를 쓰지 않는 이유: 파티션 없는 테이블의 DELETE는 테이블 전체 크기만큼 과금된다(개방표준 낙찰 11.6GiB × 하루 26회). 파티션이 아닌 테이블에는 적재를 거부한다.
 - **개방표준 낙찰 다시 조회**: 이 API는 개찰일로만 조회되고, 낙찰여부(`sucsfYn`)·최종낙찰(`fnlSucsf*`)은 개찰 후 며칠~몇 달 뒤에 채워진다. 그래서 대상 날짜에 낙찰현황에 **등록된** 결과들의 실개찰일(`rlOpengDt`)을 모아 그 개찰일들도 하루씩 다시 조회해 교체한다. 실측 하루 약 25개 날짜, API 호출 약 210회, 약 2.5분.
-- 노트북(`test.ipynb`)으로 넣은 과거 데이터는 `ingest_date`가 NULL이라 건드리지 않는다.
+- 노트북(`test.ipynb`)으로 넣은 과거 데이터는 `ingest_date`가 NULL(`__NULL__` 파티션)이라 건드리지 않는다.
 - 컬럼 구조와 타입 변환(`*Dt`/`*Date` → datetime)은 노트북과 같다. 적재할 때는 기존 테이블 스키마를 그대로 쓴다.
 - 소스 하나가 실패해도 나머지는 계속 실행한다. 실패한 소스가 있으면 exit 1로 끝나고 Cloud Run이 재시도한다.
 
@@ -89,6 +89,25 @@ for role in roles/run.developer roles/artifactregistry.writer roles/logging.logW
   gcloud projects add-iam-policy-binding $PROJECT_ID --member=serviceAccount:$BUILD_SA --role=$role
 done
 gcloud iam service-accounts add-iam-policy-binding $JOB_SA --member=serviceAccount:$BUILD_SA --role=roles/iam.serviceAccountUser
+```
+
+### 3-1. daily 테이블 파티션 전환 (최초 1회, 배포 전)
+
+노트북으로 만든 기존 테이블은 파티션이 없으므로 `ingest_date` 파티션 테이블로 다시 만든다.
+백업 → 파티션 테이블 생성 → 교체 순서. 백업은 행 수를 확인한 뒤 지운다.
+
+```bash
+DS=ipchal; STAMP=$(date +%Y%m%d)
+for t in bid_pblanc_list_info bid_pblanc_bsis_amount_list_info scsbid_list_sttus_info \
+         data_set_opn_std_bid_pblanc_info data_set_opn_std_scsbid_info; do
+  bq cp -n $PROJECT_ID:$DS.$t $PROJECT_ID:$DS.${t}__bak_$STAMP
+  # 기존 테이블에 ingest_date가 없으면 NULL 컬럼으로 추가 (이미 있으면 SELECT * 만)
+  bq query --nouse_legacy_sql "
+    CREATE TABLE \`$PROJECT_ID.$DS.${t}__part\` PARTITION BY ingest_date AS
+    SELECT *, CAST(NULL AS DATE) AS ingest_date FROM \`$PROJECT_ID.$DS.$t\`;
+    DROP TABLE \`$PROJECT_ID.$DS.$t\`;
+    ALTER TABLE \`$PROJECT_ID.$DS.${t}__part\` RENAME TO \`$t\`;"
+done
 ```
 
 ### 4. GitHub 연결 + 트리거 (콘솔)

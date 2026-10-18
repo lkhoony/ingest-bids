@@ -2,9 +2,12 @@
 
 기존 ipchal.* 테이블(test.ipynb가 autodetect로 만든 컬럼 구조)을 그대로 쓰고,
 ingest_date(DATE) 컬럼 하나만 추가해서 같은 날짜를 다시 실행해도 중복되지 않게 한다.
-  - daily 소스: DELETE WHERE ingest_date = @d → APPEND   (replace_day)
-  - full 소스 : WRITE_TRUNCATE (테이블 전체 교체)        (replace_all)
-ingest_date가 NULL인 과거 데이터(노트북으로 넣은 것)는 DELETE 조건에 걸리지 않으므로 건드리지 않는다.
+  - daily 소스: ingest_date 파티션(table$YYYYMMDD)을 WRITE_TRUNCATE로 로드   (replace_day)
+  - full 소스 : WRITE_TRUNCATE (테이블 전체 교체)                           (replace_all)
+daily 테이블은 ingest_date로 파티션되어 있어야 한다 (README "파티션 전환" 참고).
+DELETE(DML)는 파티션 없는 테이블에서 테이블 전체 크기만큼 과금되지만, 파티션 덮어쓰기 로드는 무료이고
+하루치 교체가 로드 한 번이라 중간에 실패해도 그 날짜가 비지 않는다.
+ingest_date가 NULL인 과거 데이터(노트북으로 넣은 것)는 __NULL__ 파티션에 있으므로 건드리지 않는다.
 """
 
 import logging
@@ -77,8 +80,8 @@ class BigQueryLoader:
         """
         return f"{self.client.project}.{self.dataset}.{table}"
 
-    def _schema_with_ingest_date(self, table_id: str) -> list[bigquery.SchemaField] | None:
-        """기존 테이블 스키마를 가져온다. ingest_date 컬럼이 없으면 추가한다.
+    def _table_with_ingest_date(self, table_id: str) -> bigquery.Table | None:
+        """기존 테이블을 가져온다. ingest_date 컬럼이 없으면 추가한다.
 
         컬럼 추가는 NULLABLE 컬럼 추가라서 기존 데이터에 영향이 없다.
         기존 행의 ingest_date 값은 NULL이 된다.
@@ -87,7 +90,7 @@ class BigQueryLoader:
             table_id (str): 전체 테이블 ID.
 
         Returns:
-            list[bigquery.SchemaField] | None: ingest_date가 포함된 스키마.
+            bigquery.Table | None: ingest_date가 포함된 테이블.
                 테이블이 없으면 None (첫 적재 때 autodetect로 생성하게 됨).
         """
         try:
@@ -98,10 +101,10 @@ class BigQueryLoader:
             table.schema = [*table.schema, INGEST_DATE_FIELD]
             table = self.client.update_table(table, ["schema"])
             logger.info("added ingest_date column", extra={"table": table_id})
-        return list(table.schema)
+        return table
 
     def _load(self, df: pd.DataFrame, table_id: str, schema: list[bigquery.SchemaField] | None,
-              write_disposition: str) -> int:
+              write_disposition: str, partitioned: bool = False) -> int:
         """DataFrame을 BigQuery 로드 작업으로 적재하고 완료를 기다린다.
 
         Args:
@@ -109,6 +112,8 @@ class BigQueryLoader:
             table_id (str): 전체 테이블 ID.
             schema (list[bigquery.SchemaField] | None): 적용할 스키마. None이면 autodetect.
             write_disposition (str): bigquery.WriteDisposition 값 (WRITE_APPEND / WRITE_TRUNCATE).
+            partitioned (bool): True면 ingest_date 파티션을 지정한다. 테이블이 없을 때
+                파티션 테이블로 만들고, 있으면 파티션 설정이 다를 때 로드가 실패한다.
 
         Returns:
             int: 적재된 행 수.
@@ -117,6 +122,8 @@ class BigQueryLoader:
             google.api_core.exceptions.GoogleAPIError: 로드 작업이 실패했을 때.
         """
         job_config = bigquery.LoadJobConfig(write_disposition=write_disposition)
+        if partitioned:
+            job_config.time_partitioning = bigquery.TimePartitioning(field=INGEST_DATE)
         if schema is not None:
             # 하루치 데이터에 전부 null인 컬럼이 있어도 타입이 흔들리지 않게 기존 스키마를 그대로 쓴다
             job_config.schema = schema
@@ -127,11 +134,11 @@ class BigQueryLoader:
         return job.output_rows or 0
 
     def replace_day(self, table: str, df: pd.DataFrame, ingest_date: date) -> int:
-        """테이블에서 해당 날짜(ingest_date) 분량을 지우고 df로 다시 채운다 (daily 소스용).
+        """테이블의 해당 날짜(ingest_date) 파티션을 df로 교체한다 (daily 소스용).
 
-        같은 날짜로 몇 번을 실행해도 결과가 같다(멱등).
-        DELETE 후 적재 전에 실패해도 다시 실행하면 복구된다.
-        df가 비어 있으면 해당 날짜를 지우기만 한다 (그날 데이터가 0건인 것이 최신 상태).
+        파티션 데코레이터(table$YYYYMMDD)에 WRITE_TRUNCATE로 로드하므로 그 날짜만 바뀌고,
+        같은 날짜로 몇 번을 실행해도 결과가 같다(멱등). 로드가 실패하면 기존 파티션이 그대로 남는다.
+        df가 비어 있으면 해당 파티션을 지우기만 한다 (그날 데이터가 0건인 것이 최신 상태).
 
         Args:
             table (str): 테이블 이름 (데이터셋 제외).
@@ -142,23 +149,22 @@ class BigQueryLoader:
             int: 새로 적재된 행 수 (df가 비면 0).
 
         Raises:
-            google.api_core.exceptions.GoogleAPIError: DELETE 쿼리나 로드 작업이 실패했을 때.
+            RuntimeError: 기존 테이블이 ingest_date로 파티션되어 있지 않을 때.
+                파티션 없는 테이블에 WRITE_TRUNCATE하면 테이블 전체가 지워질 수 있으므로 막는다.
+            google.api_core.exceptions.GoogleAPIError: 로드 작업이나 파티션 삭제가 실패했을 때.
         """
         table_id = self.table_id(table)
-        schema = self._schema_with_ingest_date(table_id)
-        if schema is not None:
-            # 날짜는 SQL 문자열에 직접 넣지 않고 쿼리 파라미터로 전달한다
-            delete = self.client.query(
-                f"DELETE FROM `{table_id}` WHERE {INGEST_DATE} = @d",
-                job_config=bigquery.QueryJobConfig(
-                    query_parameters=[bigquery.ScalarQueryParameter("d", "DATE", ingest_date)]
-                ),
-            )
-            delete.result()
-            logger.info("deleted existing rows", extra={"table": table_id, "rows": delete.num_dml_affected_rows})
+        existing = self._table_with_ingest_date(table_id)
+        if existing is not None and (existing.time_partitioning is None
+                                     or existing.time_partitioning.field != INGEST_DATE):
+            raise RuntimeError(f"{table_id}: ingest_date 파티션 테이블이 아닙니다 — README의 파티션 전환을 먼저 하세요.")
+        partition_id = f"{table_id}${ingest_date:%Y%m%d}"
         if df.empty:
+            if existing is not None:
+                self.client.delete_table(partition_id, not_found_ok=True)
             return 0
-        return self._load(df, table_id, schema, bigquery.WriteDisposition.WRITE_APPEND)
+        schema = list(existing.schema) if existing is not None else None
+        return self._load(df, partition_id, schema, bigquery.WriteDisposition.WRITE_TRUNCATE, partitioned=True)
 
     def replace_all(self, table: str, df: pd.DataFrame) -> int:
         """테이블 전체를 df로 덮어쓴다 (full 소스, 마스터 데이터용).
@@ -178,5 +184,6 @@ class BigQueryLoader:
         table_id = self.table_id(table)
         if df.empty:
             raise RuntimeError(f"{table_id}: 수집 결과 0건 — 기존 데이터를 지우지 않고 중단합니다.")
-        schema = self._schema_with_ingest_date(table_id)
+        existing = self._table_with_ingest_date(table_id)
+        schema = list(existing.schema) if existing is not None else None
         return self._load(df, table_id, schema, bigquery.WriteDisposition.WRITE_TRUNCATE)

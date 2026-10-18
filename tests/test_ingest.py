@@ -135,13 +135,15 @@ def test_to_dataframe_matches_notebook_conversion():
 
 # ---------- BigQuery 적재 ----------
 
-def make_loader(existing_schema=None):
+def make_loader(existing_schema=None, partitioned=True):
     client = MagicMock(spec=bigquery.Client)
     client.project = "proj"
     if existing_schema is None:
         client.get_table.side_effect = NotFound("missing")
     else:
         table = bigquery.Table("proj.ds.t", schema=existing_schema)
+        if partitioned:
+            table.time_partitioning = bigquery.TimePartitioning(field="ingest_date")
         client.get_table.return_value = table
         client.update_table.side_effect = lambda t, fields: t
     client.load_table_from_dataframe.return_value.output_rows = 1
@@ -152,40 +154,42 @@ def sample_df():
     return to_dataframe([ScsbidListSttusResItem.model_validate(scsbid_item("1"))], D)
 
 
-def test_replace_day_adds_column_deletes_then_appends_with_existing_schema():
+def test_replace_day_overwrites_only_that_partition_with_existing_schema():
     loader, client = make_loader([bigquery.SchemaField("bidNtceNo", "STRING")])
-    calls = MagicMock()
-    client.query.side_effect = lambda *a, **k: calls.query(*a, **k)
-    client.load_table_from_dataframe.side_effect = lambda *a, **k: calls.load(*a, **k)
-    calls.load.return_value.output_rows = 1
 
     assert loader.replace_day("t", sample_df(), D) == 1
 
-    # ingest_date 컬럼 추가
-    client.update_table.assert_called_once()
-    # DELETE → LOAD 순서
-    assert [c[0] for c in calls.mock_calls if c[0] in ("query", "load")] == ["query", "load"]
-    sql = calls.query.call_args.args[0]
-    assert sql == "DELETE FROM `proj.ds.t` WHERE ingest_date = @d"
-    param = calls.query.call_args.kwargs["job_config"].query_parameters[0]
-    assert (param.name, param.type_, param.value) == ("d", "DATE", D)
-    job_config = calls.load.call_args.kwargs["job_config"]
-    assert job_config.write_disposition == "WRITE_APPEND"
+    client.update_table.assert_called_once()  # ingest_date 컬럼 추가
+    client.query.assert_not_called()  # DELETE(DML) 없음 — 테이블 전체 과금 방지
+    args, kwargs = client.load_table_from_dataframe.call_args
+    assert args[1] == "proj.ds.t$20261003"
+    job_config = kwargs["job_config"]
+    assert job_config.write_disposition == "WRITE_TRUNCATE"
+    assert job_config.time_partitioning.field == "ingest_date"
     assert [f.name for f in job_config.schema] == ["bidNtceNo", "ingest_date"]
 
 
-def test_replace_day_on_missing_table_autodetects_without_delete():
+def test_replace_day_refuses_non_partitioned_table():
+    loader, client = make_loader([bigquery.SchemaField("bidNtceNo", "STRING")], partitioned=False)
+    with pytest.raises(RuntimeError, match="파티션"):
+        loader.replace_day("t", sample_df(), D)
+    client.load_table_from_dataframe.assert_not_called()
+    client.delete_table.assert_not_called()
+
+
+def test_replace_day_on_missing_table_creates_partitioned_table():
     loader, client = make_loader(None)
     loader.replace_day("t", sample_df(), D)
-    client.query.assert_not_called()
-    assert client.load_table_from_dataframe.call_args.kwargs["job_config"].autodetect is True
+    job_config = client.load_table_from_dataframe.call_args.kwargs["job_config"]
+    assert job_config.autodetect is True
+    assert job_config.time_partitioning.field == "ingest_date"
 
 
 def test_replace_day_with_no_items_still_clears_the_day():
     loader, client = make_loader([bigquery.SchemaField("bidNtceNo", "STRING"), bigquery.SchemaField("ingest_date", "DATE")])
     assert loader.replace_day("t", pd.DataFrame(), D) == 0
     client.update_table.assert_not_called()
-    client.query.assert_called_once()
+    client.delete_table.assert_called_once_with("proj.ds.t$20261003", not_found_ok=True)
     client.load_table_from_dataframe.assert_not_called()
 
 
