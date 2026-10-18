@@ -81,7 +81,7 @@ SCHED_SA=scheduler-sa@$PROJECT_ID.iam.gserviceaccount.com
 
 # Job 실행 SA: ipchal 데이터셋 쓰기 + 쿼리 실행 + 시크릿 읽기
 gcloud projects add-iam-policy-binding $PROJECT_ID --member=serviceAccount:$JOB_SA --role=roles/bigquery.jobUser
-bq add-iam-policy-binding --member=serviceAccount:$JOB_SA --role=roles/bigquery.dataEditor $PROJECT_ID:ipchal
+bq query --nouse_legacy_sql "GRANT \`roles/bigquery.dataEditor\` ON SCHEMA \`$PROJECT_ID.ipchal\` TO 'serviceAccount:$JOB_SA'"
 gcloud secrets add-iam-policy-binding openapi-key --member=serviceAccount:$JOB_SA --role=roles/secretmanager.secretAccessor
 
 # 빌드 SA: 이미지 푸시 + Job 배포 + 로그
