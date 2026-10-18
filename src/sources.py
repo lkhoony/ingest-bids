@@ -46,6 +46,9 @@ class Source:
         mode (Mode): 저장 방식. "daily" 또는 "full".
         build_params (Callable[[date], dict[str, Any]]): 대상 날짜를 받아
             이 API 전용 조회 파라미터(dict)를 돌려주는 함수.
+        refetch_by (str | None): 다시 조회할 날짜를 알려주는 소스 이름. 지정하면 대상 날짜에
+            그 소스에 등록된 결과들의 실개찰일(rlOpengDt)도 함께 다시 조회해 교체한다.
+            개찰일 기준 API에서 나중에 확정된 낙찰 결과(sucsfYn 등)를 반영하기 위해 쓴다.
     """
 
     name: str
@@ -54,6 +57,7 @@ class Source:
     response_model: type[BaseModel]
     mode: Mode
     build_params: Callable[[date], dict[str, Any]]
+    refetch_by: str | None = None
 
 
 def _day_range(d: date) -> tuple[str, str]:
@@ -127,9 +131,11 @@ SOURCES: list[Source] = [
     # 개방표준 입찰공고 (입찰공고일시 기준)
     Source("data_set_opn_std_bid_pblanc_info", "PUB_DATA_OPN_STD_SERVICE_URL",
            "data_set_opn_std_bid_pblanc_info", DataSetOpnStdBidPblancInfoAPIRes, "daily", _bid_ntce_params),
-    # 개방표준 낙찰 - 용역 (개찰일시 기준)
+    # 개방표준 낙찰 - 용역 (개찰일시 기준). 낙찰 결과는 개찰 후 며칠~몇 달 뒤 확정되므로
+    # 대상 날짜에 낙찰현황에 등록된 결과들의 개찰일도 다시 조회한다
     Source("data_set_opn_std_scsbid_info", "DATA_SET_OPN_STD_SCSBID_INFO_SERVICE_URL",
-           "data_set_opn_std_scsbid_info", DataSetOpnStdScsbidInfoAPIRes, "daily", _openg_params),
+           "data_set_opn_std_scsbid_info", DataSetOpnStdScsbidInfoAPIRes, "daily", _openg_params,
+           refetch_by="scsbid_list_sttus"),
     # 업종 및 근거법규 (마스터 데이터, 날짜 조건 없이 전체 조회)
     Source("indstryty_base_lawrglt_info", "INDSTRY_BASE_LAWRGLT_INFO_SERVICE_URL",
            "indstryty_base_lawrglt_info", IndstrytyBaseLawrgltInfoAPIRes, "full", lambda d: {}),

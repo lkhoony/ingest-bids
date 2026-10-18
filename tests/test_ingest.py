@@ -241,6 +241,31 @@ def test_dry_run_does_not_touch_bigquery(monkeypatch):
     assert asyncio.run(main_mod.run(config(), ["scsbid_list_sttus"], dry_run=True)) == []
 
 
+def test_opn_std_scsbid_refetches_opening_dates_of_newly_registered_results(monkeypatch):
+    monkeypatch.setenv("SCSBID_LIST_STTUS_SERVICE_URL", "https://api.test/results")
+    monkeypatch.setenv("DATA_SET_OPN_STD_SCSBID_INFO_SERVICE_URL", "https://api.test/opnstd")
+    results = [scsbid_item("1", rlOpengDt="2026-02-06 11:00:00"), scsbid_item("2", rlOpengDt="2026-02-06 15:00:00"),
+               scsbid_item("3", rlOpengDt="2026-10-03 10:00:00"), scsbid_item("4", rlOpengDt="2026-09-30 10:00:00"),
+               scsbid_item("5")]
+    opened = []
+
+    async def fake_fetch(url, params, model):
+        if url.endswith("/results"):
+            return [ScsbidListSttusResItem.model_validate(r) for r in results]
+        opened.append(params["opengBgnDt"][:8])
+        return []
+
+    monkeypatch.setattr(main_mod, "fetch_all", fake_fetch)
+    loader = MagicMock()
+    loader.replace_day.return_value = 0
+    source = SOURCES_BY_NAME["data_set_opn_std_scsbid_info"]
+    asyncio.run(main_mod.ingest_source(source, D, config(), loader))
+
+    # 대상 날짜 먼저, 그다음 실개찰일(중복·대상일·빈 값 제외, 오래된 순)
+    assert opened == ["20261003", "20260206", "20260930"]
+    assert [c.args[2] for c in loader.replace_day.call_args_list] == [D, date(2026, 2, 6), date(2026, 9, 30)]
+
+
 def test_unknown_source_rejected():
     with pytest.raises(SystemExit):
         main_mod.parse_args(["--sources", "nope"])

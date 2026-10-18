@@ -119,9 +119,66 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+async def refetch_dates(source: Source, target_date: date, config: Config) -> list[date]:
+    """다시 조회할 날짜 목록을 구한다 (source.refetch_by가 있는 소스용).
+
+    refetch_by 소스(낙찰현황)는 결과 등록일 기준으로 조회되므로, 대상 날짜에 등록된 결과는
+    며칠~몇 달 전에 개찰한 건일 수 있다. 그 실개찰일들을 다시 조회하면 개찰일 기준 테이블에
+    나중에 확정된 낙찰 결과가 반영된다.
+
+    Args:
+        source (Source): refetch_by가 지정된 소스.
+        target_date (date): 수집 대상 날짜.
+        config (Config): 실행 설정 (API 키).
+
+    Returns:
+        list[date]: 대상 날짜를 제외한 실개찰일 목록 (오래된 순, 중복 없음).
+
+    Raises:
+        RuntimeError: refetch_by 소스의 URL 환경변수가 없을 때.
+        OpenApiError: API 호출이 실패했을 때.
+    """
+    results = SOURCES_BY_NAME[source.refetch_by]
+    items = await fetch_all(source_url(results.url_env), base_params(results, target_date, config.api_key),
+                            results.response_model)
+    return sorted({i.rlOpengDt.date() for i in items if i.rlOpengDt} - {target_date})
+
+
 async def ingest_source(source: Source, target_date: date, config: Config,
                         loader: BigQueryLoader | None) -> int:
     """소스 하나를 수집하고 적재한다.
+
+    대상 날짜를 처리하고, refetch_by가 있으면 refetch_dates()의 날짜도 하나씩 다시 처리한다.
+    날짜마다 교체(replace_day)하므로 중간에 실패해도 다시 실행하면 복구된다.
+
+    Args:
+        source (Source): 처리할 소스.
+        target_date (date): 수집 대상 날짜.
+        config (Config): 실행 설정 (API 키 등).
+        loader (BigQueryLoader | None): 적재기. None이면 dry-run으로 보고 건수만 로그에 남긴다.
+
+    Returns:
+        int: 모든 날짜의 합계. dry-run이면 수집 건수, 아니면 적재된 행 수.
+
+    Raises:
+        RuntimeError: URL 환경변수가 없을 때, 또는 full 소스가 0건일 때.
+        OpenApiError: API 호출이 실패했을 때.
+        google.api_core.exceptions.GoogleAPIError: BigQuery 작업이 실패했을 때.
+    """
+    dates = [target_date]
+    if source.refetch_by:
+        dates += await refetch_dates(source, target_date, config)
+        logger.info("refetching dates", extra={"source": source.name, "target_date": target_date.isoformat(),
+                                               "dates": [d.isoformat() for d in dates[1:]]})
+    total = 0
+    for d in dates:
+        total += await ingest_day(source, d, config, loader)
+    return total
+
+
+async def ingest_day(source: Source, target_date: date, config: Config,
+                     loader: BigQueryLoader | None) -> int:
+    """소스 하나의 날짜 하나를 수집하고 적재한다.
 
     순서: API 전체 페이지 수집 → DataFrame 변환 → 저장 방식(mode)에 따라 적재.
 

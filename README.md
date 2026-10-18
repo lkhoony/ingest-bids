@@ -16,11 +16,12 @@ Cloud Scheduler(매일) → Cloud Run Job → 나라장터 API 6종 → BigQuery
 | bid_pblanc_bsis_amount_list_info | 등록일시 (inqryDiv=1) | bid_pblanc_bsis_amount_list_info | 날짜 교체 |
 | scsbid_list_sttus | 등록일시 (inqryDiv=1) | scsbid_list_sttus_info | 날짜 교체 |
 | data_set_opn_std_bid_pblanc_info | 입찰공고일시 | data_set_opn_std_bid_pblanc_info | 날짜 교체 |
-| data_set_opn_std_scsbid_info | 개찰일시, 용역(bsnsDivCd=5) | data_set_opn_std_scsbid_info | 날짜 교체 |
+| data_set_opn_std_scsbid_info | 개찰일시, 용역(bsnsDivCd=5) + 늦게 확정된 결과의 개찰일 | data_set_opn_std_scsbid_info | 날짜 교체 |
 | indstryty_base_lawrglt_info | 전체 (마스터 데이터) | indstryty_base_lawrglt_info | 전체 덮어쓰기 |
 
 - **대상 날짜**: 기본은 KST 기준 어제. `TARGET_DATE=YYYY-MM-DD`로 지정할 수 있다.
 - **날짜 교체**: 각 테이블에 `ingest_date`(DATE) 컬럼을 추가하고, `DELETE WHERE ingest_date = 대상날짜` 후 APPEND한다. 같은 날짜를 몇 번 다시 실행해도 중복되지 않는다.
+- **개방표준 낙찰 다시 조회**: 이 API는 개찰일로만 조회되고, 낙찰여부(`sucsfYn`)·최종낙찰(`fnlSucsf*`)은 개찰 후 며칠~몇 달 뒤에 채워진다. 그래서 대상 날짜에 낙찰현황에 **등록된** 결과들의 실개찰일(`rlOpengDt`)을 모아 그 개찰일들도 하루씩 다시 조회해 교체한다. 실측 하루 약 25개 날짜, API 호출 약 210회, 약 2.5분.
 - 노트북(`test.ipynb`)으로 넣은 과거 데이터는 `ingest_date`가 NULL이라 건드리지 않는다.
 - 컬럼 구조와 타입 변환(`*Dt`/`*Date` → datetime)은 노트북과 같다. 적재할 때는 기존 테이블 스키마를 그대로 쓴다.
 - 소스 하나가 실패해도 나머지는 계속 실행한다. 실패한 소스가 있으면 exit 1로 끝나고 Cloud Run이 재시도한다.
